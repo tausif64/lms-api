@@ -1,0 +1,217 @@
+| Route                          | Method | Purpose                              |
+| ------------------------------ | ------ | ------------------------------------ |
+| `/api/auth/login`              | POST   | Email/password or social login       |
+| `/api/auth/register`           | POST   | Email/password registration          |
+| `/api/auth/verify-email`       | POST   | Email verification (OTP or link)     |
+| `/api/auth/logout`             | POST   | Logs out the current user            |
+| `/api/auth/session`            | GET    | Returns current user session         |
+| `/api/auth/callback/:provider` | GET    | Handles social provider callback     |
+| `/api/auth/otp/send`           | POST   | Triggers OTP email (e.g., for login) |
+| `/api/auth/otp/verify`         | POST   | Verifies OTP                         |
+
+
+                                    +-------------------+
+                                    |   Recommender     |
+                                    | (Python API)      |
+                                    +-------------------+
+                                             ^ 4a. Get Recs
+                                             |
++------+   1. HTTP Request   +---------------+---------+   3. DB Query   +----------------+
+|      | ==================> |               | <---------------------> |                |
+| User |                     | Backend (API) |                         | PostgreSQL DB  |
+|      | <================== | (Express.js)  | <---------------------> | (Source of Truth)|
++------+   10. Serve Content |               |   5. Send Job Msg   |                |
+             ^               +---------------+---------+ ------------------> +----------+
+             |                         |      ^                          | RabbitMQ |
+             | 9. Request HLS Video    |      | 8b. Result Msg           | (Job Queue)|
+             |                         |      |                          +----------+
+             |                         v      +------------------+             | 6. Receive Job
+             |    2. Save Raw File   +------------------+         |             |
+             +--------------------> |                  |         |             v
+                                  |   Media Volume   |         |    +-------------------+
++-------------------+   _ _ _ _ _ > |   (/media)       | < _ _ _ | _  |     Processor     |
+| Nginx Media Server| < _ _ _ _ _ _ |                  | _ _ _ _ _ >  |  (Node.js Worker) |
++-------------------+               +------------------+         |    +-------------------+
+                                      ^ 7. Transcode & |         |
+                                      |      Save HLS  +---------+
+
+
+
+
+
+
+
+
+
+
+🧩 Simple File Upload Workflow (Browser → MinIO via Pre-Signed URL)
+1️⃣ User selects a file in the browser (React app)
+<input type="file" onChange={handleFileSelect} />
+
+2️⃣ React frontend sends request to backend for a pre-signed URL
+// React code
+const res = await fetch(`/s3/upload-url?filename=${file.name}`);
+const { url } = await res.json();  // Pre-signed PUT URL
+
+3️⃣ Backend (Node.js) generates the pre-signed URL using AWS SDK and MinIO endpoint
+// Backend Express API
+const url = await s3.getSignedUrlPromise('putObject', {
+  Bucket: 'mybucket',
+  Key: filename,
+  Expires: 60,
+});
+
+
+✅ The URL is returned to the frontend
+✅ URL allows direct upload only for a short time
+
+4️⃣ Frontend uses the pre-signed URL to upload file directly to MinIO
+// React code
+await fetch(url, {
+  method: 'PUT',
+  headers: {
+    'Content-Type': file.type
+  },
+  body: file
+});
+
+
+📦 The file is now stored in MinIO under mybucket/filename
+
+sequenceDiagram
+    participant U as User (Browser)
+    participant F as Frontend (React)
+    participant B as Backend (Node.js)
+    participant M as MinIO
+
+    U->>F: Selects a file
+    F->>B: GET /s3/upload-url?filename=example.mp4
+    B->>B: Generate pre-signed PUT URL using AWS SDK
+    B-->>F: Return pre-signed URL
+    F->>M: PUT file to MinIO using pre-signed URL
+    M-->>F: 200 OK (Upload successful)
+    F-->>U: Show success message
+
+
+// backend/index.js
+
+const express = require('express');
+const AWS = require('aws-sdk');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const s3 = new AWS.S3({
+  endpoint: process.env.MINIO_ENDPOINT || 'http://localhost:9000',
+  accessKeyId: process.env.MINIO_ACCESS_KEY || 'minioadmin',
+  secretAccessKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
+  s3ForcePathStyle: true,
+  signatureVersion: 'v4',
+});
+
+const BUCKET = process.env.MINIO_BUCKET || 'mybucket';
+
+// 🟩 Create bucket if needed
+async function ensureBucketExists() {
+  const buckets = await s3.listBuckets().promise();
+  const exists = buckets.Buckets.some((b) => b.Name === BUCKET);
+  if (!exists) {
+    await s3.createBucket({ Bucket: BUCKET }).promise();
+    console.log(`✅ Bucket "${BUCKET}" created.`);
+  } else {
+    console.log(`ℹ️ Bucket "${BUCKET}" already exists.`);
+  }
+}
+
+// 🟦 Generate pre-signed URL for upload
+app.get('/s3/upload-url', async (req, res) => {
+  const { key } = req.query;
+  if (!key) return res.status(400).json({ error: 'Missing key' });
+
+  const url = await s3.getSignedUrlPromise('putObject', {
+    Bucket: BUCKET,
+    Key: key,
+    Expires: 60,
+  });
+
+  res.json({ url });
+});
+
+// 🟦 Generate pre-signed URL for download
+app.get('/s3/download-url', async (req, res) => {
+  const { key } = req.query;
+  if (!key) return res.status(400).json({ error: 'Missing key' });
+
+  const url = await s3.getSignedUrlPromise('getObject', {
+    Bucket: BUCKET,
+    Key: key,
+    Expires: 60,
+  });
+
+  res.json({ url });
+});
+
+// ✅ Start server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, async () => {
+  await ensureBucketExists();
+  console.log(`🚀 Backend running on http://localhost:${PORT}`);
+});
+
+
+// frontend/FileUploader.js
+
+import React, { useState } from 'react';
+
+const FileUploader = ({ userId = '123' }) => {
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadedKey, setUploadedKey] = useState('');
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const s3Key = `uploads/${userId}/${file.name}`;
+    setUploadStatus('Generating upload URL...');
+
+    // Get pre-signed PUT URL
+    const res = await fetch(`http://localhost:5000/s3/upload-url?key=${encodeURIComponent(s3Key)}`);
+    const { url } = await res.json();
+
+    setUploadStatus('Uploading file...');
+    await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': file.type },
+      body: file,
+    });
+
+    setUploadStatus('✅ Upload complete');
+    setUploadedKey(s3Key);
+  };
+
+  const handleDownload = async () => {
+    const res = await fetch(`http://localhost:5000/s3/download-url?key=${encodeURIComponent(uploadedKey)}`);
+    const { url } = await res.json();
+    window.open(url, '_blank');
+  };
+
+  return (
+    <div style={{ padding: '20px' }}>
+      <h2>📤 Upload to MinIO</h2>
+      <input type="file" onChange={handleUpload} />
+      <p>{uploadStatus}</p>
+
+      {uploadedKey && (
+        <>
+          <p><strong>Stored Key:</strong> {uploadedKey}</p>
+          <button onClick={handleDownload}>⬇ Download File</button>
+        </>
+      )}
+    </div>
+  );
+};
+
+export default FileUploader;
+
