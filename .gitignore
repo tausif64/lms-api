@@ -1,4 +1,8 @@
 node_modules
+logs
+media
+prisma
+a.txt
 # Keep environment variables out of version control
 .env
 
